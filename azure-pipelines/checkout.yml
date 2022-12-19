@@ -1,0 +1,4 @@
+steps:
+  - checkout: self
+    lfs: true
+    submodules: true

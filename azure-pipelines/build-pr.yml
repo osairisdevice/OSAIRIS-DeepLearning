@@ -1,0 +1,216 @@
+pr:
+  branches:
+    include:
+    - '*'
+
+name: PR-$(Date:yyyyMMdd)$(Rev:-r)
+variables:
+  model: 'BasicModel2Epochs'
+  train: 'True'
+  more_switches: '--log_level=DEBUG --pl_deterministic'
+  run_recovery_id: ''
+  tag: ''
+  number_of_cross_validation_splits: 0
+  cluster: 'training-nc12'
+  # Disable a spurious warning
+  # https://stackoverflow.com/questions/56859264/publishing-code-coverage-results-from-reportgenerator-not-working
+  disable.coverage.autogenerate: 'true'
+
+jobs:
+  - job: CancelPreviousJobs
+    pool:
+      vmImage: 'ubuntu-20.04'
+    steps:
+      - template: cancel_aml_jobs.yml
+
+  - job: CredScan_ComponentGov
+    pool:
+      vmImage: 'windows-2019'
+    steps:
+      - template: build_windows.yaml
+
+  # Run jobs that only build the environment. These jobs have a high chance of succeeding and filling the build
+  # cache. Pytest, etc legs will only fill the cache if they succeed.
+  # - job: CreateCondaEnvCache_Windows
+  #   pool:
+  #     vmImage: 'windows-2019'
+  #   steps:
+  #     - template: inner_eye_env.yml
+
+  - job: CreateCondaEnvAndCache_Linux
+    pool:
+      vmImage: 'ubuntu-20.04'
+    steps:
+      - template: inner_eye_env.yml
+
+  - job: PyTest
+    pool:
+      vmImage: 'ubuntu-20.04'
+    steps:
+      - template: build.yaml
+
+  - job: BasicModelRegressionTest
+    dependsOn: CancelPreviousJobs
+    variables:
+      - name: tag
+        value: 'TrainBasicModel'
+      - name: more_switches
+        value: '--log_level=DEBUG --pl_deterministic --use_dataset_mount=True --regression_test_folder=RegressionTestResults/PR_BasicModel2Epochs'
+    pool:
+      vmImage: 'ubuntu-20.04'
+    steps:
+      - template: train_template.yml
+        parameters:
+          wait_for_completion: 'True'
+          max_run_duration: '30m'
+      - template: tests_after_training.yml
+        parameters:
+          pytest_mark: after_training_single_run
+          test_run_title: tests_after_training_single_run
+
+  - job: RunGpuTestsInAzureML
+    dependsOn: CancelPreviousJobs
+    variables:
+      - name: tag
+        value: 'RunGpuTests'
+    pool:
+      vmImage: 'ubuntu-20.04'
+    steps:
+      - template: train_template.yml
+        parameters:
+          wait_for_completion: 'True'
+          pytest_mark: 'gpu or cpu_and_gpu or azureml'
+          max_run_duration: '30m'
+      - task: PublishTestResults@2
+        inputs:
+          testResultsFiles: '**/test-*.xml'
+          testRunTitle: 'tests_on_AzureML'
+        condition: succeededOrFailed()
+        displayName: Publish test results
+
+  # Now train a module, using the Github code as a submodule. Here, a simpler 1 channel model
+  # is trained, because we use this build to also check the "submit_for_inference" code, that
+  # presently only handles single channel models.
+  - job: TrainInAzureMLViaSubmodule
+    dependsOn: CancelPreviousJobs
+    variables:
+      - name: model
+        value: 'BasicModel2Epochs1Channel'
+      - name: tag
+        value: 'Train1ChannelSubmodule'
+    pool:
+      vmImage: 'ubuntu-20.04'
+    steps:
+      - template: train_via_submodule.yml
+        parameters:
+          wait_for_completion: 'True'
+          max_run_duration: '30m'
+      - template: tests_after_training.yml
+        parameters:
+          pytest_mark: "inference or after_training"
+          test_run_title: tests_after_train_submodule
+
+  # Train a 2-element ensemble model
+  - job: TrainEnsemble
+    dependsOn: CancelPreviousJobs
+    variables:
+      - name: model
+        value: 'BasicModelForEnsembleTest'
+      - name: number_of_cross_validation_splits
+        value: 2
+      - name: tag
+        value: 'TrainEnsemble'
+      - name: more_switches
+        value: '--pl_deterministic --log_level=DEBUG --regression_test_folder=RegressionTestResults/PR_TrainEnsemble  --regression_test_csv_tolerance=1e-5'
+    pool:
+      vmImage: 'ubuntu-20.04'
+    steps:
+      - template: train_template.yml
+        parameters:
+          wait_for_completion: 'True'
+          pytest_mark: ''
+          max_run_duration: '1h'
+      - template: tests_after_training.yml
+        parameters:
+          pytest_mark: after_training_ensemble_run
+          test_run_title: tests_after_training_ensemble_run
+
+  # Train a model on 2 nodes
+  - job: Train2Nodes
+    dependsOn: CancelPreviousJobs
+    variables:
+      - name: model
+        value: 'BasicModel2EpochsMoreData'
+      - name: tag
+        value: 'Train2Nodes'
+      - name: more_switches
+        value: '--log_level=DEBUG --pl_deterministic --num_nodes=2 --regression_test_folder=RegressionTestResults/PR_Train2Nodes'
+    pool:
+      vmImage: 'ubuntu-20.04'
+    steps:
+      - template: train_template.yml
+        parameters:
+          wait_for_completion: 'True'
+          pytest_mark: ''
+          max_run_duration: '1h'
+      - template: tests_after_training.yml
+        parameters:
+          pytest_mark: after_training_2node
+          test_run_title: tests_after_training_2node_run
+
+  - job: TrainHelloWorld
+    dependsOn: CancelPreviousJobs
+    variables:
+      - name: model
+        value: 'HelloWorld'
+      - name: tag
+        value: 'HelloWorldPR'
+    pool:
+      vmImage: 'ubuntu-20.04'
+    steps:
+      - template: train_template.yml
+        parameters:
+          wait_for_completion: 'True'
+          pytest_mark: ''
+          max_run_duration: '30m'
+
+  # Run HelloContainer on 2 nodes. HelloContainer uses native Lighting test set inference, which can get
+  # confused after doing multi-node training in the same script.
+  - job: TrainHelloContainer
+    dependsOn: CancelPreviousJobs
+    variables:
+      - name: model
+        value: 'HelloContainer'
+      - name: tag
+        value: 'HelloContainerPR'
+      - name: more_switches
+        value: '--pl_deterministic --num_nodes=2 --max_num_gpus=2 --regression_test_folder=RegressionTestResults/PR_HelloContainer'
+    pool:
+      vmImage: 'ubuntu-20.04'
+    steps:
+      - template: train_template.yml
+        parameters:
+          wait_for_completion: 'True'
+          pytest_mark: ''
+          max_run_duration: '30m'
+      - template: tests_after_training.yml
+        parameters:
+          pytest_mark: after_training_hello_container
+          test_run_title: tests_after_training_hello_container
+
+  - job: TrainLungRegression
+    dependsOn: CancelPreviousJobs
+    variables:
+      - name: model
+        value: 'LungRegression'
+      - name: tag
+        value: 'TrainLungRegressionModel'
+      - name: more_switches
+        value: '--log_level=DEBUG --regression_test_folder=RegressionTestResults/PR_LungRegression --regression_test_csv_tolerance=0.001'
+    pool:
+      vmImage: 'ubuntu-20.04'
+    steps:
+      - template: train_template.yml
+        parameters:
+          wait_for_completion: 'True'
+          max_run_duration: '30m'
